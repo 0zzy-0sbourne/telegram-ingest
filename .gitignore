@@ -1,0 +1,16 @@
+# Environment variables
+.env
+
+# Virtual environment
+venv/
+
+# Session file
+*.session
+
+# Output log
+output_log.csv
+
+# IDE specific files
+.vscode/
+__pycache__/
+*.pyc
