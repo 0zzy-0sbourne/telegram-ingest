@@ -1,8 +1,0 @@
-services:
-  - type: worker # Specifies the service type as a background worker
-    name: telegram-ingestor # Name of the service on Render
-    runtime: python # Specifies the runtime environment
-    plan: free # Specifies the Render plan (free tier)
-    buildCommand: "pip install -r requirements.txt" # Command to install dependencies
-    startCommand: "python ingestor.py" # Command to start the application
-    # Python version is often auto-detected or can be set via runtime.txt if needed.
