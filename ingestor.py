@@ -18,8 +18,9 @@ load_dotenv()
 # --- Configuration ---
 API_ID = os.getenv('TELEGRAM_API_ID')
 API_HASH = os.getenv('TELEGRAM_API_HASH')
-PHONE_NUMBER = os.getenv('TELEGRAM_PHONE')
-SESSION_NAME = os.getenv('TELEGRAM_SESSION_NAME', "telegram_ingestor_session") # Session file name
+PHONE_NUMBER = os.getenv('TELEGRAM_PHONE') # Required for initial login if no string session
+SESSION_STRING = os.getenv('TELEGRAM_SESSION_STRING') # Prioritized session storage for deployment
+SESSION_NAME = os.getenv('TELEGRAM_SESSION_NAME', "telegram_ingestor_session") # Fallback file session name (mainly for local use/setup)
 CHANNEL_USERNAME = os.getenv('TELEGRAM_CHANNEL') # Username/ID of the target channel/chat
 # Optional external Model API
 MODEL_API_URL = os.getenv('MODEL_API_URL')
@@ -55,8 +56,13 @@ if not os.path.exists(OUTPUT_CSV_FILE):
     logger.info(f"Created output CSV file: {OUTPUT_CSV_FILE}")
 
 # --- Telethon Client ---
-# Using default StringSession (unencrypted file session)
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+# Prioritize StringSession for deployment, fall back to file session for local use/setup
+if SESSION_STRING:
+    logger.info("Using String Session for Telegram client.")
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+else:
+    logger.info(f"Using file session: {SESSION_NAME}.session")
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 async def process_with_model(message_data):
     """
@@ -250,16 +256,31 @@ async def main():
 
     logger.info(f"Initializing Telegram client for channel: {CHANNEL_USERNAME}")
     try:
-        logger.info("Starting Telegram client. Please follow prompts for phone code/password if required.")
-        await client.start(phone=PHONE_NUMBER)
+        logger.info("Starting Telegram client...")
+        if not SESSION_STRING:
+            logger.warning("No TELEGRAM_SESSION_STRING found. Attempting login with phone number.")
+            logger.warning("If running locally, follow prompts for phone code/password.")
+            logger.warning("If deploying, generate a session string locally first and set TELEGRAM_SESSION_STRING env var.")
+            await client.start(phone=PHONE_NUMBER)
+        else:
+            # String session connects directly without needing phone number after initial setup
+            await client.connect()
+            if not await client.is_user_authorized():
+                 logger.error("String Session is invalid or expired. Generate a new one locally.")
+                 # Explicitly stop if string session fails
+                 await client.disconnect()
+                 return # Prevent further execution
+
         logger.info("Telegram client started successfully.")
     except Exception as e:
         logger.error(f"Failed to start Telegram client: {e}", exc_info=True)
         return
 
+    # Check authorization again, especially after file-based login attempt
     if not await client.is_user_authorized():
-        logger.error("Client is not authorized. Please ensure login was successful.")
-        await client.disconnect()
+        logger.error("Client is not authorized. Please ensure login was successful or session string is valid.")
+        if client.is_connected():
+             await client.disconnect()
         return
 
     try:
