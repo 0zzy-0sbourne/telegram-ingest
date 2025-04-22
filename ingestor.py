@@ -12,8 +12,19 @@ from telethon.sessions import StringSession # Default session
 from telethon.tl.patched import Message # Import Message type hint
 from aiohttp import ClientSession
 
+import logging # Ensure logging is imported if not already at the very top
+
+# --- Early Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+logger.info("Logging configured.") # Confirm logging is active
+
 # Load environment variables from .env file if it exists
-load_dotenv()
+logger.info("Loading environment variables from .env...")
+# Explicitly find .env in the current directory and force override
+from dotenv import find_dotenv
+load_dotenv(find_dotenv(usecwd=True), override=True)
+logger.info("Environment variables loaded.")
 
 # --- Configuration ---
 API_ID = os.getenv('TELEGRAM_API_ID')
@@ -42,9 +53,8 @@ if not CHANNEL_USERNAME: missing_config.append('TELEGRAM_CHANNEL')
 if missing_config:
     raise ValueError(f"Missing required environment variables: {', '.join(missing_config)}")
 
-# --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# --- Log loaded phone number for debugging ---
+# Removed the PHONE_NUMBER debug log line as it was causing confusion
 
 # --- CSV Setup ---
 CSV_HEADER = ['timestamp', 'message_id', 'sender_id', 'message_text', 'action', 'confidence', 'reason', 'raw_model_response'] # Added structured fields
@@ -57,12 +67,10 @@ if not os.path.exists(OUTPUT_CSV_FILE):
 
 # --- Telethon Client ---
 # Prioritize StringSession for deployment, fall back to file session for local use/setup
-if SESSION_STRING:
-    logger.info("Using String Session for Telegram client.")
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-else:
-    logger.info(f"Using file session: {SESSION_NAME}.session")
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+# Always use StringSession. Initialize with env var if present, otherwise None.
+logger.info("Initializing client with StringSession.")
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+# Note: The file session (SESSION_NAME) is no longer used by the client directly.
 
 async def process_with_model(message_data):
     """
@@ -257,21 +265,27 @@ async def main():
     logger.info(f"Initializing Telegram client for channel: {CHANNEL_USERNAME}")
     try:
         logger.info("Starting Telegram client...")
-        if not SESSION_STRING:
-            logger.warning("No TELEGRAM_SESSION_STRING found. Attempting login with phone number.")
-            logger.warning("If running locally, follow prompts for phone code/password.")
-            logger.warning("If deploying, generate a session string locally first and set TELEGRAM_SESSION_STRING env var.")
-            await client.start(phone=PHONE_NUMBER)
-        else:
-            # String session connects directly without needing phone number after initial setup
-            await client.connect()
-            if not await client.is_user_authorized():
-                 logger.error("String Session is invalid or expired. Generate a new one locally.")
-                 # Explicitly stop if string session fails
-                 await client.disconnect()
-                 return # Prevent further execution
-
+        # Attempt to connect/login. If session is empty/invalid, it will prompt for phone/code.
+        await client.start(phone=PHONE_NUMBER)
         logger.info("Telegram client started successfully.")
+
+        # --- Print session string AFTER successful start/login ---
+        # This works because client.session is now guaranteed to be a StringSession
+        try:
+            session_str = client.session.save()
+            if session_str: # Check if string is not None/empty
+                 logger.info("="*50)
+                 logger.info("IMPORTANT: Copy the following session string and set it as the")
+                 logger.info("TELEGRAM_SESSION_STRING environment variable for deployment:")
+                 print(f"\nTELEGRAM_SESSION_STRING:\n{session_str}\n") # Print clearly to console
+                 logger.info("="*50)
+                 logger.info("You can now stop this script (Ctrl+C) if you only needed the string.")
+            else:
+                 logger.error("Could not retrieve a valid session string after login.")
+        except Exception as e_session:
+            logger.error(f"Error saving/printing session string: {e_session}")
+        # --- End session string printing ---
+
     except Exception as e:
         logger.error(f"Failed to start Telegram client: {e}", exc_info=True)
         return
