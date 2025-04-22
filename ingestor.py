@@ -37,6 +37,7 @@ CHANNEL_USERNAME = os.getenv('TELEGRAM_CHANNEL') # Username/ID of the target cha
 MODEL_API_URL = os.getenv('MODEL_API_URL')
 MODEL_API_KEY = os.getenv('MODEL_API_KEY')
 MODEL_SYSTEM_PROMPT = os.getenv('MODEL_SYSTEM_PROMPT', "You are an AI assistant processing Telegram messages.")
+MODEL_NAME = os.getenv('MODEL_NAME', 'gpt-3.5-turbo') # Default model if not specified
 # Output CSV file
 OUTPUT_CSV_FILE = os.getenv('OUTPUT_CSV_FILE', 'output_log.csv')
 # Target chat for results
@@ -92,9 +93,12 @@ async def process_with_model(message_data):
         headers = {"Content-Type": "application/json"}
         if MODEL_API_KEY:
             headers['Authorization'] = f"Bearer {MODEL_API_KEY}"
+            # Add OpenRouter specific headers
+            headers['HTTP-Referer'] = 'https://github.com/0zzy-0sbourne/telegram-ingest' # Replace with your actual site/app URL if applicable
+            headers['X-Title'] = 'Telegram Ingestor' # Replace with your actual app name if applicable
 
         payload = {
-            "model": "gpt-3.5-turbo", # Consider making model name configurable
+            "model": MODEL_NAME, # Use the configured model name
             "messages": [
                 {"role": "system", "content": MODEL_SYSTEM_PROMPT},
                 {"role": "user", "content": message_text}
@@ -102,9 +106,20 @@ async def process_with_model(message_data):
         }
 
         try:
+            # Ensure the URL ends with /chat/completions
+            api_endpoint = MODEL_API_URL.rstrip('/') + "/chat/completions"
+            logger.debug(f"Posting to endpoint: {api_endpoint}")
             async with ClientSession() as session:
-                async with session.post(MODEL_API_URL, json=payload, headers=headers, timeout=30) as response:
-                    response.raise_for_status()
+                async with session.post(api_endpoint, json=payload, headers=headers, timeout=30) as response:
+                    response.raise_for_status() # Raises for 4xx/5xx responses
+
+                    # Check content type before decoding JSON
+                    content_type = response.headers.get('Content-Type', '')
+                    if 'application/json' not in content_type.lower():
+                        response_text = await response.text()
+                        logger.error(f"Model API returned non-JSON content type '{content_type}' for message ID {message_id}. Response snippet: {response_text[:200]}...")
+                        raise ValueError(f"Unexpected content type: {content_type}") # Treat as an error
+
                     result = await response.json()
                     model_response = result.get('choices', [{}])[0].get('message', {}).get('content', 'api_no_response')
                     logger.info(f"Message ID: {message_id} - Model Response Received.")
@@ -167,63 +182,45 @@ async def process_and_log_message(message: Message):
             # Process with model (if configured)
             model_response_raw = await process_with_model(message_data)
 
-            # --- Parse Model Response ---
-            try:
-                # Attempt to parse the raw response as JSON
-                if isinstance(model_response_raw, str) and model_response_raw.startswith('{'):
-                     model_response_json = json.loads(model_response_raw)
-                     action = model_response_json.get('action', 'MISSING_ACTION')
-                     confidence = float(model_response_json.get('confidence', 0.0)) # Ensure float conversion
-                     reason = model_response_json.get('reason', 'MISSING_REASON')
-
-                     # Basic validation based on prompt rules
-                     if action not in ["LONG", "SHORT", "NONE"]:
-                         logger.warning(f"Invalid action '{action}' received from model for message {message_id}. Defaulting to NONE.")
-                         reason = f"Invalid action received: {action}"
-                         action = "NONE"
-                         confidence = 0.0 # Reset confidence for invalid action
-                     elif confidence < 0.6 and action != "NONE":
-                         logger.info(f"Confidence {confidence:.2f} < 0.6 for action '{action}' (message {message_id}). Overriding to NONE.")
-                         reason = f"Confidence below threshold ({confidence:.2f})"
-                         action = "NONE"
-                         # Keep original confidence from model in raw response, but log 0? Or log original? Let's log original for now.
-
-                elif model_response_raw == "no_model_configured":
-                     action = "NONE"
-                     confidence = 0.0
-                     reason = "no_model_configured"
-                     model_response_raw = json.dumps({"action": action, "confidence": confidence, "reason": reason})
-                elif model_response_raw == "model_api_error":
-                     action = "ERROR"
-                     confidence = 0.0
-                     reason = "model_api_error"
-                     model_response_raw = json.dumps({"action": action, "confidence": confidence, "reason": reason})
-                else: # Handle cases where model didn't return valid JSON string
-                     logger.warning(f"Model for message {message_id} did not return valid JSON: {model_response_raw}")
-                     action = "ERROR"
-                     confidence = 0.0
-                     reason = "invalid_model_response_format"
-                     # Keep raw response as is
-
-            except json.JSONDecodeError as json_err:
-                logger.error(f"Failed to parse model JSON response for message {message_id}: {json_err}")
+            # --- Interpret Model Response (No JSON Parsing) ---
+            if model_response_raw == "no_model_configured":
+                action = "NONE"
+                confidence = 0.0
+                reason = "no_model_configured"
+                # Ensure model_response_raw is a string for logging/sending
+                model_response_raw = json.dumps({"action": action, "confidence": confidence, "reason": reason})
+            elif model_response_raw == "model_api_error":
                 action = "ERROR"
                 confidence = 0.0
-                reason = f"JSONDecodeError: {json_err}"
-                model_response_raw = f"INVALID_JSON: {model_response_raw}" # Log the invalid JSON
-            except ValueError as val_err:
-                 logger.error(f"Failed to parse confidence as float for message {message_id}: {val_err}")
-                 action = "ERROR"
-                 confidence = 0.0 # Default confidence on error
-                 reason = f"ValueError: {val_err}"
-            except Exception as parse_err:
-                logger.error(f"Unexpected error parsing model response for message {message_id}: {parse_err}", exc_info=True)
+                reason = "model_api_error"
+                # Ensure model_response_raw is a string for logging/sending
+                model_response_raw = json.dumps({"action": action, "confidence": confidence, "reason": reason})
+            elif model_response_raw == "no_text_content": # Handled earlier, but double-check
+                 action = "NONE"
+                 confidence = 0.0
+                 reason = "no_text_content"
+                 model_response_raw = json.dumps({"action": action, "confidence": confidence, "reason": reason})
+            elif reason == "stale_or_irrelevant": # Check reason set earlier for stale messages
+                 action = "NONE"
+                 confidence = 0.0
+                 # Keep reason as "stale_or_irrelevant"
+                 model_response_raw = json.dumps({"action": action, "confidence": confidence, "reason": reason})
+            elif isinstance(model_response_raw, str):
+                # Treat as raw text response from the model
+                action = "RAW"
+                confidence = 1.0 # Assume valid raw response
+                reason = "Raw model response"
+                # Keep model_response_raw as is (it's already the raw string)
+            else:
+                # Unexpected type for model_response_raw
+                logger.warning(f"Unexpected type for model response for message {message_id}: {type(model_response_raw)}. Content: {model_response_raw}")
                 action = "ERROR"
                 confidence = 0.0
-                reason = f"Unexpected Parse Error: {parse_err}"
+                reason = "unexpected_response_type"
+                model_response_raw = str(model_response_raw) # Convert to string for logging
 
     except Exception as e:
-        logger.error(f"Error processing message ID {message_id}: {e}", exc_info=True)
+        logger.error(f"Error processing message ID {message_id}: {e}", exc_info=True) # Keep outer error handling
         action = "ERROR"
         confidence = 0.0
         reason = f"PROCESSING_ERROR: {e}"
@@ -241,7 +238,8 @@ async def process_and_log_message(message: Message):
         try:
             # Construct the message content (using the raw JSON string is simplest)
             # Or format it nicely: f"Msg {message_id}: {action} ({confidence:.2f}) - {reason}"
-            result_message_content = model_response_raw if model_response_raw else json.dumps({"action": action, "confidence": confidence, "reason": reason})
+            # Send the raw model response (or error indicator string) directly
+            result_message_content = model_response_raw
 
             await client.send_message(RESULT_TARGET_CHAT, result_message_content)
             logger.info(f"Sent result for message ID {message_id} to {RESULT_TARGET_CHAT}")
